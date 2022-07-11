@@ -1,13 +1,15 @@
 use crate::AppSettings;
-use anyhow::Result;
-use chrono::{DateTime, Utc};
-use oauth2::basic::BasicClient as Oauth2BasicClient;
+use anyhow::{anyhow, Context, Result};
+use chrono::{Date, DateTime, Utc};
+use oauth2::basic::{BasicClient as Oauth2BasicClient, BasicTokenResponse};
 use oauth2::reqwest::async_http_client;
 use oauth2::{AuthUrl, Scope, TokenResponse, TokenUrl};
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use std::fmt::{Display, Formatter};
-use std::time::Duration;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tokio::time::{Duration, Instant};
 
 static APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
 
@@ -16,6 +18,8 @@ static AZURE_AUTH_PATH: &str = "oauth2/v2.0/authorize";
 static AZURE_TOKEN_PATH: &str = "oauth2/v2.0/token";
 static AZURE_SCOPE: &str = "https://graph.microsoft.com/.default";
 static AZURE_APPLICATIONS_ENDPOINT: &str = "https://graph.microsoft.com/v1.0/applications/";
+static AZURE_TOKEN_MIN_LIFETIME: u64 = 60;
+static AZURE_TOKEN_FETCH_RETRY: u64 = 10;
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -82,13 +86,18 @@ struct ResponsePage {
     value: Vec<AzureApp>,
 }
 
-pub struct AzureClient {
-    oauth2_client: Oauth2BasicClient,
-    http_client: HttpClient,
+struct Token {
+    token_response: BasicTokenResponse,
+    expires_at: Instant,
 }
 
-impl AzureClient {
-    pub fn from_settings(settings: &AppSettings) -> Result<Self> {
+pub struct AzureClientTokenProvider {
+    oauth2_client: Oauth2BasicClient,
+    token: RwLock<Option<Token>>,
+}
+
+impl AzureClientTokenProvider {
+    pub fn init(settings: &AppSettings) -> Result<Self> {
         let auth_url = AuthUrl::new(format!(
             "{}/{}/{}",
             AZURE_BASE_URL, &settings.azure_tenant_id, AZURE_AUTH_PATH
@@ -104,6 +113,79 @@ impl AzureClient {
             Some(token_url),
         );
 
+        Ok(Self {
+            oauth2_client,
+            token: RwLock::new(None),
+        })
+    }
+
+    async fn refresh(&self) -> Result<Instant> {
+        let result = self
+            .oauth2_client
+            .exchange_client_credentials()
+            .add_scope(Scope::new(AZURE_SCOPE.to_string()))
+            .request_async(async_http_client)
+            .await
+            .context("Failed to retrieve Azure token");
+
+        match result {
+            Err(err) => {
+                *self.token.write().await = None;
+                Err(err)
+            }
+            Ok(token_response) => {
+                let expires_in = Duration::from_secs(
+                    token_response
+                        .expires_in()
+                        .ok_or_else(|| anyhow!("Token doesn't have expiration date"))?
+                        .as_secs(),
+                );
+                let expires_at =
+                    Instant::now() + expires_in - Duration::from_secs(AZURE_TOKEN_MIN_LIFETIME);
+                *self.token.write().await = Some(Token {
+                    token_response,
+                    expires_at,
+                });
+                Ok(expires_at)
+            }
+        }
+    }
+
+    pub async fn work_cache(&self) {
+        loop {
+            let deadline = match self.refresh().await {
+                Ok(instant) => instant,
+                Err(err) => {
+                    // TODO warn!("Failed to refresh Azure token: {}", err);
+                    Instant::now() + Duration::from_secs(AZURE_TOKEN_FETCH_RETRY)
+                }
+            };
+
+            tokio::time::sleep_until(deadline).await;
+        }
+    }
+
+    pub async fn get_secret(&self) -> Result<String> {
+        match self
+            .token
+            .read()
+            .await
+            .as_ref()
+            .filter(|t| t.expires_at > Instant::now())
+        {
+            Some(token) => Ok(token.token_response.access_token().secret().clone()),
+            None => Err(anyhow!("No Azure token available")),
+        }
+    }
+}
+
+pub struct AzureGraphClient {
+    token_provider: Arc<AzureClientTokenProvider>,
+    http_client: HttpClient,
+}
+
+impl AzureGraphClient {
+    pub fn with_token_provider(token_provider: Arc<AzureClientTokenProvider>) -> Result<Self> {
         let http_client = HttpClient::builder()
             .user_agent(APP_USER_AGENT)
             .gzip(true)
@@ -113,19 +195,12 @@ impl AzureClient {
             .build()?;
 
         Ok(Self {
-            oauth2_client,
             http_client,
+            token_provider,
         })
     }
 
     pub async fn work(&self) -> Result<()> {
-        let token_result = self
-            .oauth2_client
-            .exchange_client_credentials()
-            .add_scope(Scope::new(AZURE_SCOPE.to_string()))
-            .request_async(async_http_client)
-            .await?;
-
         let query = self
             .http_client
             .get(AZURE_APPLICATIONS_ENDPOINT)
@@ -133,7 +208,7 @@ impl AzureClient {
                 "$select",
                 "appId,displayName,keyCredentials,passwordCredentials",
             )])
-            .bearer_auth(token_result.access_token().secret())
+            .bearer_auth(self.token_provider.get_secret().await?)
             .build()?;
 
         let response = self.http_client.execute(query).await?;
