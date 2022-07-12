@@ -1,13 +1,18 @@
 mod azure;
+mod exporter;
 mod settings;
 
 use crate::azure::{AzureClientTokenProvider, AzureGraphClient};
 use crate::settings::AppSettings;
 use anyhow::Result;
 use std::sync::Arc;
+use tracing::error;
+use tracing_subscriber::prelude::*;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt().json().finish().init();
+
     let settings = AppSettings::fetch()?;
 
     let token_provider = Arc::new(AzureClientTokenProvider::init(&settings)?);
@@ -15,7 +20,10 @@ async fn main() -> Result<()> {
     tokio::task::spawn(async move {
         token_provider.work_cache().await;
     });
-    azure_client.work().await?;
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    if let Err(e) = azure_client.work().await {
+        error!("{}", e);
+    }
 
     Ok(())
 }

@@ -1,15 +1,22 @@
 use crate::AppSettings;
 use anyhow::{anyhow, Context, Result};
-use chrono::{Date, DateTime, Utc};
+use chrono::{DateTime, Utc};
 use oauth2::basic::{BasicClient as Oauth2BasicClient, BasicTokenResponse};
 use oauth2::reqwest::async_http_client;
 use oauth2::{AuthUrl, Scope, TokenResponse, TokenUrl};
+use prometheus_client::encoding::text::Encode;
+use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::registry::Registry;
+
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use std::fmt::{Display, Formatter};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, Instant};
+use tracing::warn;
 
 static APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
 
@@ -156,7 +163,7 @@ impl AzureClientTokenProvider {
             let deadline = match self.refresh().await {
                 Ok(instant) => instant,
                 Err(err) => {
-                    // TODO warn!("Failed to refresh Azure token: {}", err);
+                    warn!("Failed to refresh Azure token: {}", err);
                     Instant::now() + Duration::from_secs(AZURE_TOKEN_FETCH_RETRY)
                 }
             };
@@ -200,24 +207,63 @@ impl AzureGraphClient {
         })
     }
 
-    pub async fn work(&self) -> Result<()> {
-        let query = self
-            .http_client
-            .get(AZURE_APPLICATIONS_ENDPOINT)
-            .query(&[(
-                "$select",
-                "appId,displayName,keyCredentials,passwordCredentials",
-            )])
-            .bearer_auth(self.token_provider.get_secret().await?)
-            .build()?;
+    pub async fn work(&self) -> Result<Registry> {
+        let mut registry = <Registry>::default();
+        let credentials_metric = Family::<CredentialLabels, Gauge<u64, AtomicU64>>::default();
+        registry.register(
+            "credential_expiration",
+            "Timestamp of credential expiration",
+            Box::new(credentials_metric.clone()),
+        );
 
-        let response = self.http_client.execute(query).await?;
+        let mut url = AZURE_APPLICATIONS_ENDPOINT.to_string();
+        let mut query = &[(
+            "$select",
+            "appId,displayName,keyCredentials,passwordCredentials",
+        )];
 
-        let body = response.json::<ResponsePage>().await?;
-        for app in body.value {
-            println!("{}", app);
+        loop {
+            let response = self
+                .http_client
+                .get(url)
+                .query(query)
+                .bearer_auth(self.token_provider.get_secret().await?)
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let body = response.json::<ResponsePage>().await?;
+            for app in body.value {
+                for credential in app
+                    .password_credentials
+                    .iter()
+                    .chain(app.key_credentials.iter())
+                {
+                    credentials_metric
+                        .get_or_create(&CredentialLabels {
+                            app_name: app.display_name.to_string(),
+                            app_id: app.app_id.to_string(),
+                            key_id: credential.key_id.to_string(),
+                        })
+                        .set(credential.end_date_time.timestamp() as u64);
+                }
+            }
+
+            if let Some(next_link) = body.next_link {
+                url = next_link.clone();
+                query = &[("", "")];
+            } else {
+                break;
+            }
         }
 
-        Ok(())
+        Ok(registry)
     }
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Encode)]
+struct CredentialLabels {
+    app_id: String,
+    app_name: String,
+    key_id: String,
 }
