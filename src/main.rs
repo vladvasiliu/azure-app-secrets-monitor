@@ -3,6 +3,7 @@ mod exporter;
 mod settings;
 
 use crate::azure::{AzureClientTokenProvider, AzureGraphClient};
+use crate::exporter::Exporter;
 use crate::settings::AppSettings;
 use anyhow::Result;
 use std::sync::Arc;
@@ -17,13 +18,14 @@ async fn main() -> Result<()> {
 
     let token_provider = Arc::new(AzureClientTokenProvider::init(&settings)?);
     let azure_client = AzureGraphClient::with_token_provider(token_provider.clone())?;
+
+    let exporter = Exporter::new("127.0.0.1:8000".parse().unwrap(), azure_client);
+
     tokio::task::spawn(async move {
         token_provider.work_cache().await;
     });
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    if let Err(e) = azure_client.work().await {
-        error!("{}", e);
-    }
+
+    exporter.run().await?;
 
     Ok(())
 }

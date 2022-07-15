@@ -1,5 +1,6 @@
 use crate::AppSettings;
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use oauth2::basic::{BasicClient as Oauth2BasicClient, BasicTokenResponse};
 use oauth2::reqwest::async_http_client;
@@ -9,6 +10,7 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 
+use crate::exporter::PromScraper;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use std::fmt::{Display, Formatter};
@@ -206,8 +208,13 @@ impl AzureGraphClient {
             token_provider,
         })
     }
+}
 
-    pub async fn work(&self) -> Result<Registry> {
+#[async_trait]
+impl PromScraper for AzureGraphClient {
+    type ScrapeError = anyhow::Error;
+
+    async fn scrape(&self) -> Result<Registry> {
         let mut registry = <Registry>::default();
         let credentials_metric = Family::<CredentialLabels, Gauge<u64, AtomicU64>>::default();
         registry.register(
@@ -258,6 +265,18 @@ impl AzureGraphClient {
         }
 
         Ok(registry)
+    }
+
+    async fn ready(&self) -> std::result::Result<String, String> {
+        self.token_provider
+            .get_secret()
+            .await
+            .map(|_| String::from("Ok"))
+            .map_err(|e| format!("Unavailable: {}", e))
+    }
+
+    fn name(&self) -> &str {
+        "Azure App Secrets"
     }
 }
 
