@@ -8,7 +8,7 @@ use oauth2::{AuthUrl, Scope, TokenResponse, TokenUrl};
 use prometheus_client::encoding::text::Encode;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
-use prometheus_client::registry::Registry;
+use prometheus_client::registry::{Registry, Unit};
 
 use crate::exporter::PromScraper;
 use reqwest::Client as HttpClient;
@@ -33,12 +33,12 @@ static AZURE_TOKEN_FETCH_RETRY: u64 = 10;
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct Credentials {
-    custom_key_identifier: Option<String>,
+    // custom_key_identifier: Option<String>,
     display_name: Option<String>,
     end_date_time: DateTime<Utc>,
-    hint: Option<String>,
+    // hint: Option<String>,
     key_id: String,
-    start_date_time: DateTime<Utc>,
+    // start_date_time: DateTime<Utc>,
 }
 
 impl Display for Credentials {
@@ -217,9 +217,10 @@ impl PromScraper for AzureGraphClient {
     async fn scrape(&self) -> Result<Registry> {
         let mut registry = <Registry>::default();
         let credentials_metric = Family::<CredentialLabels, Gauge<u64, AtomicU64>>::default();
-        registry.register(
-            "credential_expiration",
+        registry.register_with_unit(
+            "credential_expiration_time",
             "Timestamp of credential expiration",
+            Unit::Seconds,
             Box::new(credentials_metric.clone()),
         );
 

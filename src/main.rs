@@ -7,7 +7,6 @@ use crate::exporter::Exporter;
 use crate::settings::AppSettings;
 use anyhow::Result;
 use std::sync::Arc;
-use tracing::error;
 use tracing_subscriber::prelude::*;
 
 #[tokio::main(flavor = "current_thread")]

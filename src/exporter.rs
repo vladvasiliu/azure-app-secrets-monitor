@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
-use axum::{Router, Server};
+use axum::Router;
 use oauth2::http::header;
 use prometheus_client::encoding::text::encode;
 use prometheus_client::registry::Registry;
@@ -96,10 +96,13 @@ async fn metrics<T: PromScraper + Send + Sync + 'static>(scraper: Arc<T>) -> imp
             let mut buffer = vec![];
             encode(&mut buffer, &registry).unwrap();
             (
-                [(
-                    header::CONTENT_TYPE,
-                    "application/openmetrics-text; version=1.0.0; charset=utf-8",
-                )],
+                [
+                    (
+                        header::CONTENT_TYPE,
+                        "application/openmetrics-text; version=1.0.0; charset=utf-8",
+                    ),
+                    (header::CONTENT_DISPOSITION, "inline"),
+                ],
                 String::from_utf8(buffer).unwrap(),
             )
                 .into_response()
