@@ -18,11 +18,11 @@ async fn main() -> Result<()> {
     let token_provider = Arc::new(AzureClientTokenProvider::init(&settings)?);
     let azure_client = AzureGraphClient::with_token_provider(token_provider.clone())?;
 
-    let exporter = Exporter::new("127.0.0.1:8000".parse().unwrap(), azure_client);
-
     tokio::task::spawn(async move {
         token_provider.work_cache().await;
     });
+
+    let exporter = Exporter::new("127.0.0.1:8000".parse().unwrap(), azure_client);
 
     exporter.run().await?;
 

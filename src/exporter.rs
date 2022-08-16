@@ -1,32 +1,44 @@
+use anyhow::Result;
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::Router;
-use oauth2::http::header;
-use prometheus_client::encoding::text::encode;
+use prometheus_client::encoding::text::{encode, Encode};
+use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
-use std::fmt::Display;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tracing::warn;
 
 #[async_trait]
 pub trait PromScraper {
-    type ScrapeError: Display;
+    async fn scrape(&self) -> Result<Registry>;
 
-    async fn scrape(&self) -> Result<Registry, Self::ScrapeError>;
-
-    /// Return wether the scraper is ready to go.
+    /// Return whether the scraper is ready to go.
     /// The contained message will be displayed on the `/status` page.
-    async fn ready(&self) -> Result<String, String>;
+    async fn ready(&self) -> std::result::Result<String, String>;
 
     fn name(&self) -> &str;
+}
+
+#[derive(Clone, Eq, Hash, PartialEq, Encode)]
+pub struct SuccessMetricLabels {
+    outcome: Outcome,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, Encode)]
+pub enum Outcome {
+    Success,
+    Failure,
 }
 
 pub struct Exporter<T: PromScraper> {
     socket: SocketAddr,
     home_page: Html<String>,
-    registry: Registry,
+    // registry: Arc<Registry>,
+    // success_metric: Arc<Family<SuccessMetricLabels, Counter>>,
     scraper: Arc<T>,
 }
 
@@ -48,17 +60,24 @@ impl<T: PromScraper + Send + Sync + 'static> Exporter<T> {
     }
 
     pub fn with_home_page(socket: SocketAddr, scraper: T, home_page: Html<String>) -> Self {
-        let registry = <Registry>::default();
-
         Self {
             socket,
-            registry,
             scraper: Arc::new(scraper),
+            // success_metric: Arc::new(success_metric),
             home_page,
         }
     }
 
     pub async fn run(&self) -> Result<(), axum::Error> {
+        let mut registry = <Registry>::default();
+        let success_metric = Family::<SuccessMetricLabels, Counter>::default();
+        registry.register(
+            "scrape_status",
+            "Whether the scrape was successful",
+            Box::new(success_metric.clone()),
+        );
+        let success_metric = Arc::new(success_metric);
+        let registry = Arc::new(registry);
         let home_page = self.home_page.clone();
         let app = Router::new()
             .route("/", get(|| async { home_page }))
@@ -72,8 +91,34 @@ impl<T: PromScraper + Send + Sync + 'static> Exporter<T> {
             .route(
                 "/metrics",
                 get({
+                    // TODO: Extract in separate method
                     let scraper = Arc::clone(&self.scraper);
-                    move || metrics(scraper)
+                    let success_metric = Arc::clone(&success_metric);
+                    let registry = Arc::clone(&registry);
+                    || async move {
+                        let mut registries = vec![&*registry];
+                        let scrape_result = scraper.scrape().await;
+                        let scrape_registry;
+                        let outcome = match scrape_result {
+                            Ok(scrape_reg) => {
+                                scrape_registry = scrape_reg;
+                                registries.push(&scrape_registry);
+                                Outcome::Success
+                            }
+                            Err(err) => {
+                                warn!("Scrape failed: {}", err);
+                                Outcome::Failure
+                            }
+                        };
+                        success_metric
+                            .get_or_create(&SuccessMetricLabels { outcome })
+                            .inc();
+                        let mut buffer = vec![];
+                        encode(&mut buffer, &registries).expect("Registry encoding failed");
+                        let result = String::from_utf8(buffer)
+                            .expect("Failed to parse UTF-8 from encoded registry");
+                        result.into_response()
+                    }
                 }),
             );
         axum::Server::bind(&self.socket)
@@ -87,26 +132,5 @@ async fn status<T: PromScraper + Send + Sync + 'static>(scraper: Arc<T>) -> impl
     match scraper.ready().await {
         Ok(msg) => msg.into_response(),
         Err(err) => (StatusCode::SERVICE_UNAVAILABLE, err).into_response(),
-    }
-}
-
-async fn metrics<T: PromScraper + Send + Sync + 'static>(scraper: Arc<T>) -> impl IntoResponse {
-    match scraper.scrape().await {
-        Ok(registry) => {
-            let mut buffer = vec![];
-            encode(&mut buffer, &registry).unwrap();
-            (
-                [
-                    (
-                        header::CONTENT_TYPE,
-                        "application/openmetrics-text; version=1.0.0; charset=utf-8",
-                    ),
-                    (header::CONTENT_DISPOSITION, "inline"),
-                ],
-                String::from_utf8(buffer).unwrap(),
-            )
-                .into_response()
-        }
-        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
     }
 }

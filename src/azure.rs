@@ -212,8 +212,6 @@ impl AzureGraphClient {
 
 #[async_trait]
 impl PromScraper for AzureGraphClient {
-    type ScrapeError = anyhow::Error;
-
     async fn scrape(&self) -> Result<Registry> {
         let mut registry = <Registry>::default();
         let credentials_metric = Family::<CredentialLabels, Gauge<u64, AtomicU64>>::default();

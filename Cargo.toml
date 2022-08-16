@@ -12,7 +12,8 @@ axum = { version = "0.5", default_features = false, features = ["http1", "matche
 chrono = "0.4"
 config = { version = "0.13", features = ["ini"] }
 oauth2 = "4"
-prometheus-client = "0.16"
+#prometheus-client = "0.18"
+prometheus-client = { git = "https://github.com/vladvasiliu/client_rust.git", rev = "73c6e94" }
 reqwest = { version = "0.11", features = ["brotli", "gzip", "json"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "parking_lot", "rt", "sync", "time"] }
