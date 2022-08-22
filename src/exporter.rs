@@ -48,8 +48,6 @@ impl Encode for Outcome {
 pub struct Exporter<T: PromScraper> {
     socket: SocketAddr,
     home_page: Html<String>,
-    // registry: Arc<Registry>,
-    // success_metric: Arc<Family<SuccessMetricLabels, Counter>>,
     scraper: Arc<T>,
 }
 
@@ -74,7 +72,6 @@ impl<T: PromScraper + Send + Sync + 'static> Exporter<T> {
         Self {
             socket,
             scraper: Arc::new(scraper),
-            // success_metric: Arc::new(success_metric),
             home_page,
         }
     }
