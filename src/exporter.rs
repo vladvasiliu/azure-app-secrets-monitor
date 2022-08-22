@@ -11,7 +11,7 @@ use prometheus_client::registry::Registry;
 use std::io::{Error, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{info, warn};
 
 #[async_trait]
 pub trait PromScraper {
@@ -105,6 +105,7 @@ impl<T: PromScraper + Send + Sync + 'static> Exporter<T> {
                     || async move { get_metrics(&*scraper, &*success_metric, &*registry).await }
                 }),
             );
+        info!("Listening on {}", &self.socket);
         axum::Server::bind(&self.socket)
             .serve(app.into_make_service())
             .await
