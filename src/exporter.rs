@@ -8,6 +8,7 @@ use prometheus_client::encoding::text::{encode, Encode};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::registry::Registry;
+use std::io::{Error, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::warn;
@@ -28,10 +29,20 @@ pub struct SuccessMetricLabels {
     outcome: Outcome,
 }
 
-#[derive(Clone, Hash, PartialEq, Eq, Encode)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 pub enum Outcome {
     Success,
     Failure,
+}
+
+impl Encode for Outcome {
+    fn encode(&self, writer: &mut dyn Write) -> std::result::Result<(), Error> {
+        let str = match self {
+            Self::Failure => "failure",
+            Self::Success => "success",
+        };
+        write!(writer, "{}", str)
+    }
 }
 
 pub struct Exporter<T: PromScraper> {
