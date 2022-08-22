@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use prometheus_client::encoding::text::{encode, Encode};
@@ -102,34 +102,10 @@ impl<T: PromScraper + Send + Sync + 'static> Exporter<T> {
             .route(
                 "/metrics",
                 get({
-                    // TODO: Extract in separate method
                     let scraper = Arc::clone(&self.scraper);
                     let success_metric = Arc::clone(&success_metric);
                     let registry = Arc::clone(&registry);
-                    || async move {
-                        let mut registries = vec![&*registry];
-                        let scrape_result = scraper.scrape().await;
-                        let scrape_registry;
-                        let outcome = match scrape_result {
-                            Ok(scrape_reg) => {
-                                scrape_registry = scrape_reg;
-                                registries.push(&scrape_registry);
-                                Outcome::Success
-                            }
-                            Err(err) => {
-                                warn!("Scrape failed: {}", err);
-                                Outcome::Failure
-                            }
-                        };
-                        success_metric
-                            .get_or_create(&SuccessMetricLabels { outcome })
-                            .inc();
-                        let mut buffer = vec![];
-                        encode(&mut buffer, &registries).expect("Registry encoding failed");
-                        let result = String::from_utf8(buffer)
-                            .expect("Failed to parse UTF-8 from encoded registry");
-                        result.into_response()
-                    }
+                    || async move { get_metrics(&*scraper, &*success_metric, &*registry).await }
                 }),
             );
         axum::Server::bind(&self.socket)
@@ -144,4 +120,32 @@ async fn status<T: PromScraper + Send + Sync + 'static>(scraper: Arc<T>) -> impl
         Ok(msg) => msg.into_response(),
         Err(err) => (StatusCode::SERVICE_UNAVAILABLE, err).into_response(),
     }
+}
+
+async fn get_metrics<S: PromScraper + Send + Sync + 'static>(
+    scraper: &S,
+    success_metric: &Family<SuccessMetricLabels, Counter>,
+    registry: &Registry,
+) -> Response {
+    let mut registries = vec![registry];
+    let scrape_result = scraper.scrape().await;
+    let scrape_registry;
+    let outcome = match scrape_result {
+        Ok(scrape_reg) => {
+            scrape_registry = scrape_reg;
+            registries.push(&scrape_registry);
+            Outcome::Success
+        }
+        Err(err) => {
+            warn!("Scrape failed: {}", err);
+            Outcome::Failure
+        }
+    };
+    success_metric
+        .get_or_create(&SuccessMetricLabels { outcome })
+        .inc();
+    let mut buffer = vec![];
+    encode(&mut buffer, &registries).expect("Registry encoding failed");
+    let result = String::from_utf8(buffer).expect("Failed to parse UTF-8 from encoded registry");
+    result.into_response()
 }

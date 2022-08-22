@@ -9,6 +9,7 @@ edition = "2021"
 anyhow = { version = "1", features = ["backtrace"] }
 async-trait = "0.1"
 axum = { version = "0.5", default_features = false, features = ["http1", "matched-path"] }
+axum-macros = "0.2"
 chrono = "0.4"
 config = { version = "0.13", features = ["ini"] }
 oauth2 = "4"
