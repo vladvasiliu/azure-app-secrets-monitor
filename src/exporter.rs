@@ -11,7 +11,7 @@ use prometheus_client::registry::Registry;
 use std::io::{Error, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[async_trait]
 pub trait PromScraper {
@@ -76,7 +76,7 @@ impl<T: PromScraper + Send + Sync + 'static> Exporter<T> {
         }
     }
 
-    pub async fn run(&self) -> Result<(), axum::Error> {
+    pub async fn run(&self) {
         let mut registry = <Registry>::default();
         let success_metric = Family::<SuccessMetricLabels, Counter>::default();
         registry.register(
@@ -105,11 +105,17 @@ impl<T: PromScraper + Send + Sync + 'static> Exporter<T> {
                     || async move { get_metrics(&*scraper, &*success_metric, &*registry).await }
                 }),
             );
-        info!("Listening on {}", &self.socket);
-        axum::Server::bind(&self.socket)
-            .serve(app.into_make_service())
-            .await
-            .map_err(axum::Error::new)
+        let server = axum::Server::bind(&self.socket).serve(app.into_make_service());
+        info!("Listening on {}", server.local_addr());
+        let graceful = server.with_graceful_shutdown(async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("Failed to listen for ctrl-c");
+        });
+        match graceful.await.map_err(axum::Error::new) {
+            Ok(()) => info!("Exporter is shut down"),
+            Err(err) => error!("Server error: {}", err),
+        }
     }
 }
 

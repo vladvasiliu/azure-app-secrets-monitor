@@ -17,7 +17,7 @@ oauth2 = "4"
 prometheus-client = { git = "https://github.com/vladvasiliu/client_rust.git", rev = "73c6e94" }
 reqwest = { version = "0.11", features = ["brotli", "gzip", "json"] }
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "parking_lot", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "parking_lot", "rt", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "smallvec"] }
 #graph-rs-sdk = "0.2"

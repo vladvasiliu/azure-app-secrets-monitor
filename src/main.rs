@@ -24,10 +24,9 @@ async fn main() -> Result<()> {
     });
 
     let listen: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), settings.port);
-
     let exporter = Exporter::new(listen, azure_client);
 
-    exporter.run().await?;
+    exporter.run().await;
 
     Ok(())
 }
