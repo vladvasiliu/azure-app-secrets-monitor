@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
@@ -144,8 +144,20 @@ async fn get_metrics<S: PromScraper + Send + Sync + 'static>(
     success_metric
         .get_or_create(&SuccessMetricLabels { outcome })
         .inc();
+    match output_metrics(registries) {
+        Ok(output) => output,
+        Err(err) => {
+            let msg = format!("Metrics output failed: {}", err);
+            warn!(msg);
+            (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+        }
+    }
+}
+
+fn output_metrics(registries: Vec<&Registry>) -> Result<Response> {
     let mut buffer = vec![];
-    encode(&mut buffer, &registries).expect("Registry encoding failed");
-    let result = String::from_utf8(buffer).expect("Failed to parse UTF-8 from encoded registry");
-    result.into_response()
+    encode(&mut buffer, &registries).context("Registry encoding failed")?;
+    let result =
+        String::from_utf8(buffer).context("Failed to parse UTF-8 from encoded registry")?;
+    Ok(result.into_response())
 }
