@@ -15,7 +15,7 @@ impl AppSettings {
     pub fn fetch() -> Result<Self> {
         let config = Config::builder()
             .set_default("port", DEFAULT_PORT)?
-            .add_source(File::with_name("config"))
+            .add_source(File::with_name("config").required(false))
             .add_source(Environment::with_prefix("AASM"))
             .build()?;
 
