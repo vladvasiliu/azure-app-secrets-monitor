@@ -6,6 +6,7 @@ use crate::azure::{AzureClientTokenProvider, AzureGraphClient};
 use crate::exporter::Exporter;
 use crate::settings::AppSettings;
 use anyhow::Result;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tracing_subscriber::prelude::*;
 
@@ -22,9 +23,10 @@ async fn main() -> Result<()> {
         token_provider.work_cache().await;
     });
 
-    let exporter = Exporter::new("127.0.0.1:8000".parse().unwrap(), azure_client);
+    let listen: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), settings.port);
+    let exporter = Exporter::new(listen, azure_client);
 
-    exporter.run().await?;
+    exporter.run().await;
 
     Ok(())
 }
