@@ -1,4 +1,4 @@
-ARG RUST_VERSION="1.63.0"
+ARG RUST_VERSION="1.65.0"
 ARG DEBIAN_VERSION="bullseye"
 
 ARG VERSION="0.0.1"
@@ -9,7 +9,8 @@ FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} as builder
 ARG VERSION
 
 WORKDIR /code
-COPY . /code
+COPY Cargo.toml Cargo.lock /code/
+COPY src /code/src/
 
 SHELL ["/bin/bash", "-c", "-o", "pipefail"]
 # remove leading v from version number and use it as the crate version
@@ -18,7 +19,8 @@ RUN CRATE_VERSION=$(echo ${VERSION} | sed "s/v\(.*\)/\1/") &&\
     cargo build --release
 
 
-FROM debian:${DEBIAN_VERSION}-slim
+# hadolint ignore=DL3007
+FROM gcr.io/distroless/cc-debian11:latest
 
 ARG VERSION
 ARG BUILD_DATE
@@ -35,7 +37,6 @@ LABEL org.opencontainers.image.authors="Vlad Vasiliu"
 EXPOSE 9912
 WORKDIR /
 
-RUN apt-get update && apt-get install --no-install-recommends -y curl=7.74.0-1.3+deb11u2 ca-certificates=20210119 && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /code/target/release/azure-app-secrets-monitor /
 
