@@ -1,7 +1,8 @@
 [package]
 name = "azure-app-secrets-monitor"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
+authors = ["Vlad Vasiliu"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -15,7 +16,7 @@ config = { version = "0.13", features = ["ini"] }
 oauth2 = "4"
 #prometheus-client = "0.18"
 prometheus-client = { git = "https://github.com/vladvasiliu/client_rust.git", rev = "73c6e94" }
-reqwest = { version = "0.11", features = ["brotli", "gzip", "json", "rustls-tls"] }
+reqwest = { version = "0.11", default_features = false, features = ["gzip", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "parking_lot", "rt", "signal", "sync", "time"] }
 tracing = "0.1"

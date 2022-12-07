@@ -7,6 +7,7 @@ use axum::Router;
 use prometheus_client::encoding::text::{encode, Encode};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::info::Info;
 use prometheus_client::registry::Registry;
 use std::io::{Error, Write};
 use std::net::SocketAddr;
@@ -86,6 +87,12 @@ impl<T: PromScraper + Send + Sync + 'static> Exporter<T> {
             Box::new(success_metric.clone()),
         );
         let success_metric = Arc::new(success_metric);
+        let info_metric = Info::new(vec![("version", env!["CARGO_PKG_VERSION"])]);
+        registry.register(
+            "azure_app_secrets_monitor_build_info",
+            "Information about the scraper itself",
+            Box::new(info_metric),
+        );
         let registry = Arc::new(registry);
         let home_page = self.home_page.clone();
         let app = Router::new()
