@@ -11,6 +11,7 @@ use prometheus_client::registry::Registry;
 use std::io::{Error, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::signal;
 use tracing::{error, info, warn};
 
 #[async_trait]
@@ -102,16 +103,12 @@ impl<T: PromScraper + Send + Sync + 'static> Exporter<T> {
                     let scraper = Arc::clone(&self.scraper);
                     let success_metric = Arc::clone(&success_metric);
                     let registry = Arc::clone(&registry);
-                    || async move { get_metrics(&*scraper, &*success_metric, &*registry).await }
+                    || async move { get_metrics(&*scraper, &success_metric, &registry).await }
                 }),
             );
         let server = axum::Server::bind(&self.socket).serve(app.into_make_service());
         info!("Listening on {}", server.local_addr());
-        let graceful = server.with_graceful_shutdown(async {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to listen for ctrl-c");
-        });
+        let graceful = server.with_graceful_shutdown(shutdown_signal());
         match graceful.await.map_err(axum::Error::new) {
             Ok(()) => info!("Exporter is shut down"),
             Err(err) => error!("Server error: {}", err),
@@ -164,4 +161,31 @@ fn output_metrics(registries: Vec<&Registry>) -> Result<Response> {
     let result =
         String::from_utf8(buffer).context("Failed to parse UTF-8 from encoded registry")?;
     Ok(result.into_response())
+}
+
+// Lifted from https://github.com/tokio-rs/axum/blob/main/examples/graceful-shutdown/src/main.rs
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    info!("signal received, starting graceful shutdown");
 }
