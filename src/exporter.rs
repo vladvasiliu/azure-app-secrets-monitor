@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -167,7 +167,15 @@ fn output_metrics(registries: Vec<&Registry>) -> Result<Response> {
     encode(&mut buffer, &registries).context("Registry encoding failed")?;
     let result =
         String::from_utf8(buffer).context("Failed to parse UTF-8 from encoded registry")?;
-    Ok(result.into_response())
+    let response = (
+        [(
+            header::CONTENT_TYPE,
+            "application/openmetrics-text; version=1.0.0; charset=utf-8",
+        )],
+        result,
+    )
+        .into_response();
+    Ok(response)
 }
 
 // Lifted from https://github.com/tokio-rs/axum/blob/main/examples/graceful-shutdown/src/main.rs
