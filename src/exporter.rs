@@ -89,7 +89,7 @@ impl<T: PromScraper + Send + Sync + 'static> Exporter<T> {
         let success_metric = Arc::new(success_metric);
         let info_metric = Info::new(vec![("version", env!["CARGO_PKG_VERSION"])]);
         registry.register(
-            "azure_app_secrets_monitor_build_info",
+            "azure_app_secrets_monitor_build",
             "Information about the scraper itself",
             Box::new(info_metric),
         );

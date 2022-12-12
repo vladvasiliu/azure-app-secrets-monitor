@@ -137,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "azure-app-secrets-monitor"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
