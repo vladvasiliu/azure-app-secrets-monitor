@@ -4,12 +4,13 @@ use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use prometheus_client::encoding::text::{encode, Encode};
+use prometheus_client::encoding::text::{encode_eof, encode_registry};
+use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEncoder};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::info::Info;
 use prometheus_client::registry::Registry;
-use std::io::{Error, Write};
+use std::fmt::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -27,24 +28,24 @@ pub trait PromScraper {
     fn name(&self) -> &str;
 }
 
-#[derive(Clone, Eq, Hash, PartialEq, Encode)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelSet)]
 pub struct SuccessMetricLabels {
     outcome: Outcome,
 }
 
-#[derive(Clone, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Outcome {
     Success,
     Failure,
 }
 
-impl Encode for Outcome {
-    fn encode(&self, writer: &mut dyn Write) -> std::result::Result<(), Error> {
+impl EncodeLabelValue for Outcome {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> std::result::Result<(), std::fmt::Error> {
         let str = match self {
             Self::Failure => "failure",
             Self::Success => "success",
         };
-        write!(writer, "{}", str)
+        write!(encoder, "{}", str)
     }
 }
 
@@ -85,14 +86,14 @@ impl<T: PromScraper + Send + Sync + 'static> Exporter<T> {
         registry.register(
             "scrape_status",
             "Whether the scrape was successful",
-            Box::new(success_metric.clone()),
+            success_metric.clone(),
         );
         let success_metric = Arc::new(success_metric);
         let info_metric = Info::new(vec![("version", env!["CARGO_PKG_VERSION"])]);
         registry.register(
             "azure_app_secrets_monitor_build",
             "Information about the scraper itself",
-            Box::new(info_metric),
+            info_metric,
         );
         let registry = Arc::new(registry);
         let home_page = self.home_page.clone();
@@ -169,11 +170,17 @@ async fn get_metrics<S: PromScraper + Send + Sync + 'static>(
     })
 }
 
+fn encode_registries(registries: Vec<&Registry>) -> Result<String> {
+    let mut buffer = String::new();
+    for registry in registries {
+        encode_registry(&mut buffer, registry).context("Registry encoding failed")?;
+    }
+    encode_eof(&mut buffer).context("Registry encoding failed")?;
+    Ok(buffer)
+}
+
 fn output_metrics(registries: Vec<&Registry>) -> Result<Response> {
-    let mut buffer = vec![];
-    encode(&mut buffer, &registries).context("Registry encoding failed")?;
-    let result =
-        String::from_utf8(buffer).context("Failed to parse UTF-8 from encoded registry")?;
+    let result = encode_registries(registries)?;
     let response = (
         [(
             header::CONTENT_TYPE,
@@ -210,4 +217,70 @@ async fn shutdown_signal() {
     }
 
     info!("signal received, starting graceful shutdown");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::azure::test_support::scrape_registry;
+
+    /// Pins the OpenMetrics payload served by `/metrics`, including the way the
+    /// exporter's own registry is concatenated with the per-scrape one.
+    #[test]
+    fn encodes_multiple_registries() {
+        let mut registry = <Registry>::default();
+        let success_metric = Family::<SuccessMetricLabels, Counter>::default();
+        registry.register(
+            "scrape_status",
+            "Whether the scrape was successful",
+            success_metric.clone(),
+        );
+        registry.register(
+            "azure_app_secrets_monitor_build",
+            "Information about the scraper itself",
+            Info::new(vec![("version", "9.9.9")]),
+        );
+
+        success_metric
+            .get_or_create(&SuccessMetricLabels {
+                outcome: Outcome::Success,
+            })
+            .inc();
+        for _ in 0..3 {
+            success_metric
+                .get_or_create(&SuccessMetricLabels {
+                    outcome: Outcome::Failure,
+                })
+                .inc();
+        }
+
+        let scrape_reg = scrape_registry();
+        let output = encode_registries(vec![&registry, &scrape_reg]).unwrap();
+
+        // A `Family`'s series come out in `HashMap` order, so compare as a set.
+        let mut got: Vec<&str> = output.lines().collect();
+        got.sort_unstable();
+        let mut want = vec![
+            "# HELP scrape_status Whether the scrape was successful.",
+            "# TYPE scrape_status counter",
+            "scrape_status_total{outcome=\"failure\"} 3",
+            "scrape_status_total{outcome=\"success\"} 1",
+            "# HELP azure_app_secrets_monitor_build Information about the scraper itself.",
+            "# TYPE azure_app_secrets_monitor_build info",
+            "azure_app_secrets_monitor_build_info{version=\"9.9.9\"} 1",
+            "# HELP credential_expiration_time_seconds Timestamp of credential expiration.",
+            "# TYPE credential_expiration_time_seconds gauge",
+            "# UNIT credential_expiration_time_seconds seconds",
+            "credential_expiration_time_seconds{app_id=\"aaaa-1111\",app_name=\"First App\",key_id=\"key-1\"} 1700000000",
+            "credential_expiration_time_seconds{app_id=\"bbbb-2222\",app_name=\"Second \"quoted\" App\",key_id=\"key-2\"} 1800000000",
+            "credential_expiration_time_seconds{app_id=\"cccc-3333\",app_name=\"Backslash \\ App\",key_id=\"key-3\"} 1900000000",
+            "# EOF",
+        ];
+        want.sort_unstable();
+        assert_eq!(got, want);
+
+        // The terminator belongs at the very end, exactly once.
+        assert!(output.ends_with("# EOF\n"));
+        assert_eq!(output.matches("# EOF").count(), 1);
+    }
 }

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use oauth2::basic::{BasicClient as Oauth2BasicClient, BasicTokenResponse};
 use oauth2::{AuthUrl, EndpointNotSet, EndpointSet, Scope, TokenResponse, TokenUrl};
-use prometheus_client::encoding::text::Encode;
+use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::{Registry, Unit};
@@ -228,7 +228,7 @@ impl PromScraper for AzureGraphClient {
             "credential_expiration_time",
             "Timestamp of credential expiration",
             Unit::Seconds,
-            Box::new(credentials_metric.clone()),
+            credentials_metric.clone(),
         );
 
         let mut url = AZURE_APPLICATIONS_ENDPOINT.to_string();
@@ -288,9 +288,41 @@ impl PromScraper for AzureGraphClient {
     }
 }
 
-#[derive(Clone, Hash, PartialEq, Eq, Encode)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct CredentialLabels {
     app_id: String,
     app_name: String,
     key_id: String,
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Build a scrape registry with fixed data, mirroring what `scrape` produces.
+    pub(crate) fn scrape_registry() -> Registry {
+        let mut registry = <Registry>::default();
+        let credentials_metric = Family::<CredentialLabels, Gauge<u64, AtomicU64>>::default();
+        registry.register_with_unit(
+            "credential_expiration_time",
+            "Timestamp of credential expiration",
+            Unit::Seconds,
+            credentials_metric.clone(),
+        );
+
+        for (app_name, app_id, key_id, ts) in [
+            ("First App", "aaaa-1111", "key-1", 1_700_000_000_u64),
+            ("Second \"quoted\" App", "bbbb-2222", "key-2", 1_800_000_000),
+            ("Backslash \\ App", "cccc-3333", "key-3", 1_900_000_000),
+        ] {
+            credentials_metric
+                .get_or_create(&CredentialLabels {
+                    app_name: app_name.to_string(),
+                    app_id: app_id.to_string(),
+                    key_id: key_id.to_string(),
+                })
+                .set(ts);
+        }
+        registry
+    }
 }

@@ -19,8 +19,7 @@ SHELL ["/bin/bash", "-c", "-o", "pipefail"]
 # remove leading v from version number and use it as the crate version
 RUN CRATE_VERSION=$(echo ${VERSION} | sed "s/v\(.*\)/\1/") &&\
     sed -ri "s/^version = \".*\"/version = \"${CRATE_VERSION}\"/" Cargo.toml &&\
-    # Fix crates.io update bug on aarch64\
-    cargo --config net.git-fetch-with-cli=true build --release
+    cargo build --release
 
 
 # hadolint ignore=DL3007
