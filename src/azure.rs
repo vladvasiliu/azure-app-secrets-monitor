@@ -3,8 +3,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use oauth2::basic::{BasicClient as Oauth2BasicClient, BasicTokenResponse};
-use oauth2::reqwest::async_http_client;
-use oauth2::{AuthUrl, Scope, TokenResponse, TokenUrl};
+use oauth2::{AuthUrl, EndpointNotSet, EndpointSet, Scope, TokenResponse, TokenUrl};
 use prometheus_client::encoding::text::Encode;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
@@ -100,8 +99,14 @@ struct Token {
     expires_at: Instant,
 }
 
+/// `BasicClient` tracks which endpoints are configured in its type.
+/// Only the auth and token URIs are set here.
+type AzureOauth2Client =
+    Oauth2BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
+
 pub struct AzureClientTokenProvider {
-    oauth2_client: Oauth2BasicClient,
+    oauth2_client: AzureOauth2Client,
+    oauth2_http_client: HttpClient,
     token: RwLock<Option<Token>>,
 }
 
@@ -109,21 +114,26 @@ impl AzureClientTokenProvider {
     pub fn init(settings: &AppSettings) -> Result<Self> {
         let auth_url = AuthUrl::new(format!(
             "{}/{}/{}",
-            AZURE_BASE_URL, &settings.azure_tenant_id, AZURE_AUTH_PATH
+            AZURE_BASE_URL, settings.azure_tenant_id, AZURE_AUTH_PATH
         ))?;
         let token_url = TokenUrl::new(format!(
             "{}/{}/{}",
-            AZURE_BASE_URL, &settings.azure_tenant_id, AZURE_TOKEN_PATH
+            AZURE_BASE_URL, settings.azure_tenant_id, AZURE_TOKEN_PATH
         ))?;
-        let oauth2_client = Oauth2BasicClient::new(
-            settings.azure_client_id.to_owned(),
-            Some(settings.azure_client_secret.to_owned()),
-            auth_url,
-            Some(token_url),
-        );
+        let oauth2_client = Oauth2BasicClient::new(settings.azure_client_id.to_owned())
+            .set_client_secret(settings.azure_client_secret.to_owned())
+            .set_auth_uri(auth_url)
+            .set_token_uri(token_url);
+
+        // The token endpoint must not follow redirects, so that the credentials
+        // are never replayed against another host.
+        let oauth2_http_client = HttpClient::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
 
         Ok(Self {
             oauth2_client,
+            oauth2_http_client,
             token: RwLock::new(None),
         })
     }
@@ -133,7 +143,7 @@ impl AzureClientTokenProvider {
             .oauth2_client
             .exchange_client_credentials()
             .add_scope(Scope::new(AZURE_SCOPE.to_string()))
-            .request_async(async_http_client)
+            .request_async(&self.oauth2_http_client)
             .await
             .context("Failed to retrieve Azure token");
 
