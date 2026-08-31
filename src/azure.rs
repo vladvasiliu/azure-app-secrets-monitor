@@ -9,7 +9,7 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::{Registry, Unit};
 
-use crate::exporter::PromScraper;
+use crate::exporter::{LabelValue, PromScraper};
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use std::fmt::{Display, Formatter};
@@ -256,9 +256,9 @@ impl PromScraper for AzureGraphClient {
                 {
                     credentials_metric
                         .get_or_create(&CredentialLabels {
-                            app_name: app.display_name.to_string(),
-                            app_id: app.app_id.to_string(),
-                            key_id: credential.key_id.to_string(),
+                            app_name: app.display_name.as_str().into(),
+                            app_id: app.app_id.as_str().into(),
+                            key_id: credential.key_id.as_str().into(),
                         })
                         .set(credential.end_date_time.timestamp() as u64);
                 }
@@ -290,9 +290,9 @@ impl PromScraper for AzureGraphClient {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct CredentialLabels {
-    app_id: String,
-    app_name: String,
-    key_id: String,
+    app_id: LabelValue,
+    app_name: LabelValue,
+    key_id: LabelValue,
 }
 
 #[cfg(test)]
@@ -317,9 +317,9 @@ pub(crate) mod test_support {
         ] {
             credentials_metric
                 .get_or_create(&CredentialLabels {
-                    app_name: app_name.to_string(),
-                    app_id: app_id.to_string(),
-                    key_id: key_id.to_string(),
+                    app_name: app_name.into(),
+                    app_id: app_id.into(),
+                    key_id: key_id.into(),
                 })
                 .set(ts);
         }

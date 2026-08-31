@@ -49,6 +49,36 @@ impl EncodeLabelValue for Outcome {
     }
 }
 
+/// A label value escaped for the OpenMetrics text format.
+///
+/// `prometheus_client` writes label values verbatim between the quotes it emits
+/// (see `LabelValueEncoder`), so a value containing `"`, `\` or a newline would
+/// produce malformed output. Azure app display names are free text, so they have
+/// to be escaped here. Revisit if `prometheus_client` ever escapes them itself,
+/// as that would double-escape.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct LabelValue(String);
+
+impl<T: Into<String>> From<T> for LabelValue {
+    fn from(value: T) -> Self {
+        Self(value.into())
+    }
+}
+
+impl EncodeLabelValue for LabelValue {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> std::result::Result<(), std::fmt::Error> {
+        for c in self.0.chars() {
+            match c {
+                '\\' => encoder.write_str(r"\\")?,
+                '"' => encoder.write_str("\\\"")?,
+                '\n' => encoder.write_str(r"\n")?,
+                _ => encoder.write_char(c)?,
+            }
+        }
+        Ok(())
+    }
+}
+
 pub struct Exporter<T: PromScraper> {
     socket: SocketAddr,
     home_page: Html<String>,
@@ -224,6 +254,42 @@ mod tests {
     use super::*;
     use crate::azure::test_support::scrape_registry;
 
+    /// Label values must be escaped per the OpenMetrics text format, otherwise an
+    /// app whose Azure display name contains a quote breaks the whole scrape.
+    #[test]
+    fn escapes_label_values() {
+        #[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelSet)]
+        struct Labels {
+            name: LabelValue,
+        }
+
+        for (raw, want) in [
+            ("plain", "plain"),
+            ("", ""),
+            (r#"a "quoted" name"#, r#"a \"quoted\" name"#),
+            (r"back\slash", r"back\\slash"),
+            ("two\nlines", r"two\nlines"),
+            ("\\\"\n", r#"\\\"\n"#),
+            ("héllo → ok", "héllo → ok"),
+        ] {
+            let mut registry = <Registry>::default();
+            let family = Family::<Labels, Counter>::default();
+            registry.register("m", "h", family.clone());
+            family.get_or_create(&Labels { name: raw.into() }).inc();
+
+            let output = encode_registries(vec![&registry]).unwrap();
+            let line = output
+                .lines()
+                .find(|l| l.starts_with("m_total"))
+                .expect("sample line");
+            assert_eq!(
+                line,
+                format!("m_total{{name=\"{want}\"}} 1"),
+                "input: {raw:?}"
+            );
+        }
+    }
+
     /// Pins the OpenMetrics payload served by `/metrics`, including the way the
     /// exporter's own registry is concatenated with the per-scrape one.
     #[test]
@@ -272,8 +338,8 @@ mod tests {
             "# TYPE credential_expiration_time_seconds gauge",
             "# UNIT credential_expiration_time_seconds seconds",
             "credential_expiration_time_seconds{app_id=\"aaaa-1111\",app_name=\"First App\",key_id=\"key-1\"} 1700000000",
-            "credential_expiration_time_seconds{app_id=\"bbbb-2222\",app_name=\"Second \"quoted\" App\",key_id=\"key-2\"} 1800000000",
-            "credential_expiration_time_seconds{app_id=\"cccc-3333\",app_name=\"Backslash \\ App\",key_id=\"key-3\"} 1900000000",
+            "credential_expiration_time_seconds{app_id=\"bbbb-2222\",app_name=\"Second \\\"quoted\\\" App\",key_id=\"key-2\"} 1800000000",
+            "credential_expiration_time_seconds{app_id=\"cccc-3333\",app_name=\"Backslash \\\\ App\",key_id=\"key-3\"} 1900000000",
             "# EOF",
         ];
         want.sort_unstable();
