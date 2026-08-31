@@ -12,6 +12,7 @@ use prometheus_client::registry::Registry;
 use std::io::{Error, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::{error, info, warn};
 
@@ -113,10 +114,19 @@ impl<T: PromScraper + Send + Sync + 'static> Exporter<T> {
                     || async move { get_metrics(&*scraper, &success_metric, &registry).await }
                 }),
             );
-        let server = axum::Server::bind(&self.socket).serve(app.into_make_service());
-        info!("Listening on {}", server.local_addr());
-        let graceful = server.with_graceful_shutdown(shutdown_signal());
-        match graceful.await.map_err(axum::Error::new) {
+        let listener = match TcpListener::bind(&self.socket).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                error!("Failed to bind to {}: {}", self.socket, err);
+                return;
+            }
+        };
+        match listener.local_addr() {
+            Ok(addr) => info!("Listening on {}", addr),
+            Err(err) => warn!("Failed to get local address: {}", err),
+        }
+        let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+        match server.await {
             Ok(()) => info!("Exporter is shut down"),
             Err(err) => error!("Server error: {}", err),
         }
@@ -152,14 +162,11 @@ async fn get_metrics<S: PromScraper + Send + Sync + 'static>(
     success_metric
         .get_or_create(&SuccessMetricLabels { outcome })
         .inc();
-    match output_metrics(registries) {
-        Ok(output) => output,
-        Err(err) => {
-            let msg = format!("Metrics output failed: {}", err);
-            warn!(msg);
-            (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
-        }
-    }
+    output_metrics(registries).unwrap_or_else(|err| {
+        let msg = format!("Metrics output failed: {}", err);
+        warn!(msg);
+        (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
+    })
 }
 
 fn output_metrics(registries: Vec<&Registry>) -> Result<Response> {

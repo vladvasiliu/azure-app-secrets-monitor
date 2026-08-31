@@ -1,7 +1,7 @@
 [package]
 name = "azure-app-secrets-monitor"
-version = "0.1.5"
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
 authors = ["Vlad Vasiliu"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -9,16 +9,15 @@ authors = ["Vlad Vasiliu"]
 [dependencies]
 anyhow = { version = "1", features = ["backtrace"] }
 async-trait = "0.1"
-axum = { version = "0.6", default_features = false, features = ["http1", "matched-path", "tokio"] }
-axum-macros = "0.3"
+axum = { version = "0.8", default-features = false, features = ["http1", "matched-path", "tokio"] }
 chrono = "0.4"
-config = { version = "0.13", features = ["ini"] }
+config = { version = "0.15", features = ["ini"] }
 oauth2 = "4"
 #prometheus-client = "0.18"
 prometheus-client = { git = "https://github.com/vladvasiliu/client_rust.git", rev = "73c6e94" }
-reqwest = { version = "0.11", default_features = false, features = ["gzip", "json", "rustls-tls"] }
+reqwest = { version = "0.11", default-features = false, features = ["gzip", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "parking_lot", "rt", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "net", "parking_lot", "rt", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "smallvec"] }
 #graph-rs-sdk = "0.2"
