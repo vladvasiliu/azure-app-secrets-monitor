@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use axum::http::{header, StatusCode};
+use axum::Router;
+use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
 use prometheus_client::encoding::text::{encode_eof, encode_registry};
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEncoder};
 use prometheus_client::metrics::counter::Counter;
@@ -13,9 +13,10 @@ use prometheus_client::registry::Registry;
 use std::fmt::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::signal;
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 
 #[async_trait]
 pub trait PromScraper {
@@ -78,6 +79,25 @@ impl EncodeLabelValue for LabelValue {
         Ok(())
     }
 }
+
+/// A failed HTTP call to the service being scraped.
+///
+/// Scrapers return it inside their `anyhow` error so that the status and
+/// request id can be logged as fields, not only as part of the message.
+#[derive(Debug)]
+pub struct UpstreamHttpError {
+    pub status: u16,
+    pub request_id: Option<String>,
+    pub message: String,
+}
+
+impl std::fmt::Display for UpstreamHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for UpstreamHttpError {}
 
 pub struct Exporter<T: PromScraper> {
     socket: SocketAddr,
@@ -148,18 +168,18 @@ impl<T: PromScraper + Send + Sync + 'static> Exporter<T> {
         let listener = match TcpListener::bind(&self.socket).await {
             Ok(listener) => listener,
             Err(err) => {
-                error!("Failed to bind to {}: {}", self.socket, err);
+                error!(address = %self.socket, error = %err, "Failed to bind");
                 return;
             }
         };
         match listener.local_addr() {
-            Ok(addr) => info!("Listening on {}", addr),
-            Err(err) => warn!("Failed to get local address: {}", err),
+            Ok(addr) => info!(address = %addr, "Listening"),
+            Err(err) => warn!(error = %err, "Failed to get local address"),
         }
         let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
         match server.await {
             Ok(()) => info!("Exporter is shut down"),
-            Err(err) => error!("Server error: {}", err),
+            Err(err) => error!(error = %err, "Server error"),
         }
     }
 }
@@ -171,22 +191,36 @@ async fn status<T: PromScraper + Send + Sync + 'static>(scraper: Arc<T>) -> impl
     }
 }
 
+#[instrument(name = "scrape", skip_all, fields(action = "scrape", scraper = scraper.name()))]
 async fn get_metrics<S: PromScraper + Send + Sync + 'static>(
     scraper: &S,
     success_metric: &Family<SuccessMetricLabels, Counter>,
     registry: &Registry,
 ) -> Response {
     let mut registries = vec![registry];
+    let start = Instant::now();
     let scrape_result = scraper.scrape().await;
+    let duration_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let scrape_registry;
     let outcome = match scrape_result {
         Ok(scrape_reg) => {
+            info!(duration_ns, outcome = "success", "Scrape succeeded");
             scrape_registry = scrape_reg;
             registries.push(&scrape_registry);
             Outcome::Success
         }
         Err(err) => {
-            warn!("Scrape failed: {}", err);
+            let http_error = err
+                .chain()
+                .find_map(|e| e.downcast_ref::<UpstreamHttpError>());
+            warn!(
+                duration_ns,
+                outcome = "failure",
+                error = %format!("{err:#}"),
+                http_status = http_error.map(|e| e.status),
+                request_id = http_error.and_then(|e| e.request_id.as_deref()),
+                "Scrape failed"
+            );
             Outcome::Failure
         }
     };
@@ -194,8 +228,8 @@ async fn get_metrics<S: PromScraper + Send + Sync + 'static>(
         .get_or_create(&SuccessMetricLabels { outcome })
         .inc();
     output_metrics(registries).unwrap_or_else(|err| {
-        let msg = format!("Metrics output failed: {}", err);
-        warn!(msg);
+        let msg = format!("Metrics output failed: {err:#}");
+        warn!(error = %format!("{err:#}"), "Metrics output failed");
         (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
     })
 }
@@ -252,7 +286,57 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::azure::test_support::scrape_registry;
+    use crate::azure::test_support::{graph_client, scrape_registry};
+    use crate::logging::test_support::LogCapture;
+    use axum::http::HeaderMap;
+    use serde_json::json;
+
+    /// Runs a real scrape against a mock Graph that rejects the request, and
+    /// checks that the status and request id reach the log as ECS fields.
+    #[tokio::test]
+    async fn logs_graph_errors_as_http_fields() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mock_graph = Router::new().route(
+            "/applications/",
+            get(|headers: HeaderMap| async move {
+                if headers.get(header::AUTHORIZATION).unwrap() != "Bearer test-token" {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                (
+                    StatusCode::FORBIDDEN,
+                    [("request-id", "abc-123")],
+                    r#"{"error":{"code":"Authorization_RequestDenied","message":"Insufficient privileges to complete the operation."}}"#,
+                )
+                    .into_response()
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, mock_graph).await.unwrap() });
+        let scraper = graph_client(format!("http://{addr}/applications/")).await;
+
+        let logs = LogCapture::start();
+        let response = get_metrics(&scraper, &Family::default(), &Registry::default()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let lines = logs.lines();
+        let failure = lines
+            .iter()
+            .find(|line| line["message"] == "Scrape failed")
+            .unwrap_or_else(|| panic!("no scrape failure logged: {lines:?}"));
+        assert_eq!(
+            failure["http"],
+            json!({"request": {"id": "abc-123"}, "response": {"status_code": 403}})
+        );
+        assert_eq!(
+            failure["error"]["message"],
+            "Graph returned 403 Forbidden: Authorization_RequestDenied: \
+             Insufficient privileges to complete the operation."
+        );
+        assert_eq!(failure["event"]["action"], "scrape");
+        assert_eq!(failure["event"]["outcome"], "failure");
+        assert!(failure["event"]["duration"].as_u64().unwrap() > 0);
+        assert_eq!(failure["log"]["level"], "warn");
+    }
 
     /// Label values must be escaped per the OpenMetrics text format, otherwise an
     /// app whose Azure display name contains a quote breaks the whole scrape.

@@ -130,6 +130,7 @@ dependencies = [
  "prometheus-client",
  "reqwest",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

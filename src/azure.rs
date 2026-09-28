@@ -1,5 +1,5 @@
 use crate::AppSettings;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use oauth2::basic::{BasicClient as Oauth2BasicClient, BasicTokenResponse};
@@ -9,15 +9,15 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::{Registry, Unit};
 
-use crate::exporter::{LabelValue, PromScraper};
-use reqwest::Client as HttpClient;
+use crate::exporter::{LabelValue, PromScraper, UpstreamHttpError};
+use reqwest::{Client as HttpClient, Response, StatusCode};
 use serde::Deserialize;
 use std::fmt::{Display, Formatter};
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, Instant};
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 static APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
 
@@ -28,6 +28,8 @@ static AZURE_SCOPE: &str = "https://graph.microsoft.com/.default";
 static AZURE_APPLICATIONS_ENDPOINT: &str = "https://graph.microsoft.com/v1.0/applications/";
 static AZURE_TOKEN_MIN_LIFETIME: u64 = 60;
 static AZURE_TOKEN_FETCH_RETRY: u64 = 10;
+/// Unparseable error bodies are logged verbatim, up to this many characters.
+static GRAPH_ERROR_BODY_MAX_CHARS: usize = 1024;
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -85,6 +87,50 @@ impl Display for AzureApp {
 
         write!(f, "{}", result)
     }
+}
+
+/// Error body returned by Microsoft Graph on failed requests.
+#[derive(Deserialize, Debug)]
+struct GraphErrorResponse {
+    error: GraphError,
+}
+
+#[derive(Deserialize, Debug)]
+struct GraphError {
+    code: String,
+    message: String,
+}
+
+/// Turn a failed Graph response into an error that says why it failed.
+///
+/// `error_for_status` only keeps the status code, but the body carries Graph's
+/// error code and message, and the `request-id` header is what Microsoft
+/// support asks for.
+async fn graph_error(response: Response) -> anyhow::Error {
+    let status = response.status();
+    let request_id = response
+        .headers()
+        .get("request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let message = match response.text().await {
+        Ok(body) => describe_graph_error(status, &body),
+        Err(err) => format!("Graph returned {status} and its body could not be read: {err}"),
+    };
+    UpstreamHttpError {
+        status: status.as_u16(),
+        request_id,
+        message,
+    }
+    .into()
+}
+
+fn describe_graph_error(status: StatusCode, body: &str) -> String {
+    let detail = match serde_json::from_str::<GraphErrorResponse>(body) {
+        Ok(GraphErrorResponse { error }) => format!("{}: {}", error.code, error.message),
+        Err(_) => body.chars().take(GRAPH_ERROR_BODY_MAX_CHARS).collect(),
+    };
+    format!("Graph returned {status}: {detail}")
 }
 
 #[derive(Deserialize, Debug)]
@@ -161,6 +207,12 @@ impl AzureClientTokenProvider {
                 );
                 let expires_at =
                     Instant::now() + expires_in - Duration::from_secs(AZURE_TOKEN_MIN_LIFETIME);
+                info!(
+                    action = "token-refresh",
+                    outcome = "success",
+                    expires_in_secs = expires_in.as_secs(),
+                    "Azure token refreshed"
+                );
                 *self.token.write().await = Some(Token {
                     token_response,
                     expires_at,
@@ -172,13 +224,16 @@ impl AzureClientTokenProvider {
 
     pub async fn work_cache(&self) {
         loop {
-            let deadline = match self.refresh().await {
-                Ok(instant) => instant,
-                Err(err) => {
-                    warn!("Failed to refresh Azure token: {}", err);
-                    Instant::now() + Duration::from_secs(AZURE_TOKEN_FETCH_RETRY)
-                }
-            };
+            let deadline = self.refresh().await.unwrap_or_else(|err| {
+                warn!(
+                    action = "token-refresh",
+                    outcome = "failure",
+                    error = %format!("{err:#}"),
+                    retry_in_secs = AZURE_TOKEN_FETCH_RETRY,
+                    "Failed to refresh Azure token"
+                );
+                Instant::now() + Duration::from_secs(AZURE_TOKEN_FETCH_RETRY)
+            });
 
             tokio::time::sleep_until(deadline).await;
         }
@@ -201,20 +256,35 @@ impl AzureClientTokenProvider {
 pub struct AzureGraphClient {
     token_provider: Arc<AzureClientTokenProvider>,
     http_client: HttpClient,
+    applications_endpoint: String,
 }
 
 impl AzureGraphClient {
     pub fn with_token_provider(token_provider: Arc<AzureClientTokenProvider>) -> Result<Self> {
+        Self::new(
+            token_provider,
+            AZURE_APPLICATIONS_ENDPOINT.to_string(),
+            true,
+        )
+    }
+
+    /// `https_only` is only turned off by tests, which talk to a local mock.
+    fn new(
+        token_provider: Arc<AzureClientTokenProvider>,
+        applications_endpoint: String,
+        https_only: bool,
+    ) -> Result<Self> {
         let http_client = HttpClient::builder()
             .user_agent(APP_USER_AGENT)
             .gzip(true)
             .timeout(Duration::from_secs(2))
-            .https_only(true)
+            .https_only(https_only)
             .build()?;
 
         Ok(Self {
             http_client,
             token_provider,
+            applications_endpoint,
         })
     }
 }
@@ -231,23 +301,36 @@ impl PromScraper for AzureGraphClient {
             credentials_metric.clone(),
         );
 
-        let mut url = AZURE_APPLICATIONS_ENDPOINT.to_string();
+        let mut url = self.applications_endpoint.clone();
         let mut query = &[(
             "$select",
             "appId,displayName,keyCredentials,passwordCredentials",
         )];
 
+        let mut page: u32 = 0;
         loop {
+            page += 1;
             let response = self
                 .http_client
                 .get(url)
                 .query(query)
                 .bearer_auth(self.token_provider.get_secret().await?)
                 .send()
-                .await?
-                .error_for_status()?;
+                .await
+                .with_context(|| format!("Graph request for page {page} failed"))?;
+            if !response.status().is_success() {
+                return Err(graph_error(response).await);
+            }
 
-            let body = response.json::<ResponsePage>().await?;
+            let body = response
+                .json::<ResponsePage>()
+                .await
+                .with_context(|| format!("Failed to decode Graph response page {page}"))?;
+            debug!(
+                page,
+                apps = body.value.len(),
+                "Fetched Graph applications page"
+            );
             for app in body.value {
                 for credential in app
                     .password_credentials
@@ -296,8 +379,60 @@ struct CredentialLabels {
 }
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn describes_graph_errors() {
+        let body = r#"{"error":{"code":"Authorization_RequestDenied","message":"Insufficient privileges to complete the operation.","innerError":{"date":"2026-09-28T10:00:00"}}}"#;
+        assert_eq!(
+            describe_graph_error(StatusCode::FORBIDDEN, body),
+            "Graph returned 403 Forbidden: Authorization_RequestDenied: \
+             Insufficient privileges to complete the operation."
+        );
+    }
+
+    #[test]
+    fn describes_non_graph_errors_verbatim() {
+        let body = "<html>Bad Gateway</html>";
+        assert_eq!(
+            describe_graph_error(StatusCode::BAD_GATEWAY, body),
+            "Graph returned 502 Bad Gateway: <html>Bad Gateway</html>"
+        );
+
+        let long = "x".repeat(GRAPH_ERROR_BODY_MAX_CHARS * 2);
+        let described = describe_graph_error(StatusCode::BAD_GATEWAY, &long);
+        assert!(described.contains(&"x".repeat(GRAPH_ERROR_BODY_MAX_CHARS)));
+        assert!(!described.contains(&"x".repeat(GRAPH_ERROR_BODY_MAX_CHARS + 1)));
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use oauth2::basic::BasicTokenType;
+    use oauth2::{AccessToken, ClientId, ClientSecret, EmptyExtraTokenFields};
+
+    /// A Graph client that already holds a valid token and sends its requests
+    /// to `applications_endpoint` instead of Microsoft Graph.
+    pub(crate) async fn graph_client(applications_endpoint: String) -> AzureGraphClient {
+        let settings = AppSettings {
+            azure_client_id: ClientId::new("client-id".to_string()),
+            azure_client_secret: ClientSecret::new("client-secret".to_string()),
+            azure_tenant_id: "tenant-id".to_string(),
+            port: 0,
+        };
+        let token_provider = AzureClientTokenProvider::init(&settings).unwrap();
+        *token_provider.token.write().await = Some(Token {
+            token_response: BasicTokenResponse::new(
+                AccessToken::new("test-token".to_string()),
+                BasicTokenType::Bearer,
+                EmptyExtraTokenFields {},
+            ),
+            expires_at: Instant::now() + Duration::from_secs(3600),
+        });
+        AzureGraphClient::new(Arc::new(token_provider), applications_endpoint, false).unwrap()
+    }
 
     /// Build a scrape registry with fixed data, mirroring what `scrape` produces.
     pub(crate) fn scrape_registry() -> Registry {
