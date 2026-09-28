@@ -277,7 +277,7 @@ impl AzureGraphClient {
         let http_client = HttpClient::builder()
             .user_agent(APP_USER_AGENT)
             .gzip(true)
-            .timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
             .https_only(https_only)
             .build()?;
 

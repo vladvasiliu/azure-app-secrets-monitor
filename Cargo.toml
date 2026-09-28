@@ -1,6 +1,6 @@
 [package]
 name = "azure-app-secrets-monitor"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 authors = ["Vlad Vasiliu"]
 
@@ -14,6 +14,7 @@ chrono = "0.4"
 config = { version = "0.15", features = ["ini"] }
 oauth2 = { version = "5", default-features = false, features = ["reqwest", "rustls-tls"] }
 prometheus-client = "0.25"
+rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["gzip", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

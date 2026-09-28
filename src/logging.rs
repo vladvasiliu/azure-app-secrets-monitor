@@ -98,19 +98,33 @@ fn insert_field(doc: &mut Map<String, Value>, name: &str, value: Value) {
         "error" => "error.message",
         "http_status" => "http.response.status_code",
         "request_id" => "http.request.id",
+        "trace_id" => "trace.id",
+        "method" => "http.request.method",
+        "http_version" => "http.version",
+        "path" => "url.path",
+        "user_agent" => "user_agent.original",
         // ECS durations are in nanoseconds.
         "duration_ns" => "event.duration",
-        "address" => match value.as_str().and_then(|s| s.parse::<SocketAddr>().ok()) {
-            Some(addr) => {
-                insert_path(doc, "server.ip", addr.ip().to_string().into());
-                insert_path(doc, "server.port", addr.port().into());
-                return;
-            }
-            None => "server.address",
-        },
+        "address" => return insert_socket_address(doc, "server", value),
+        "client_address" => return insert_socket_address(doc, "client", value),
         _ => return insert_custom(doc, name, value),
     };
     insert_path(doc, path, value);
+}
+
+/// Split an `ip:port` value into ECS `<prefix>.ip` and `<prefix>.port`.
+///
+/// The exporter listens on `[::]`, so IPv4 clients arrive as IPv4-mapped IPv6
+/// addresses (`::ffff:10.0.0.1`); they are logged as plain IPv4.
+fn insert_socket_address(doc: &mut Map<String, Value>, prefix: &str, value: Value) {
+    match value.as_str().and_then(|s| s.parse::<SocketAddr>().ok()) {
+        Some(addr) => {
+            let ip = addr.ip().to_canonical();
+            insert_path(doc, &format!("{prefix}.ip"), ip.to_string().into());
+            insert_path(doc, &format!("{prefix}.port"), addr.port().into());
+        }
+        None => insert_path(doc, &format!("{prefix}.address"), value),
+    }
 }
 
 fn insert_custom(doc: &mut Map<String, Value>, name: &str, value: Value) {
@@ -205,11 +219,17 @@ pub(crate) mod test_support {
 
     impl LogCapture {
         pub(crate) fn start() -> Self {
+            Self::with_filter("trace")
+        }
+
+        /// Like `start`, with an `EnvFilter` directive such as `RUST_LOG` takes.
+        pub(crate) fn with_filter(directive: &str) -> Self {
             let buffer = Buffer::default();
             let writer = buffer.clone();
             let subscriber = tracing_subscriber::fmt()
                 .fmt_fields(JsonFields::new())
                 .event_format(EcsFormat)
+                .with_env_filter(EnvFilter::new(directive))
                 .with_writer(move || writer.clone())
                 .finish();
             Self {
@@ -283,5 +303,15 @@ mod tests {
         let addr: SocketAddr = "[::]:9912".parse().unwrap();
         let doc = capture(|| tracing::info!(address = %addr, "Listening"));
         assert_eq!(doc["server"], serde_json::json!({"ip": "::", "port": 9912}));
+    }
+
+    #[test]
+    fn logs_ipv4_mapped_addresses_as_ipv4() {
+        let addr: SocketAddr = "[::ffff:10.0.0.1]:55384".parse().unwrap();
+        let doc = capture(|| tracing::info!(client_address = %addr, "GET / 200"));
+        assert_eq!(
+            doc["client"],
+            serde_json::json!({"ip": "10.0.0.1", "port": 55384})
+        );
     }
 }

@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use axum::Router;
-use axum::http::{StatusCode, header};
+use axum::extract::{ConnectInfo, Request};
+use axum::http::{HeaderMap, StatusCode, Version, header};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use prometheus_client::encoding::text::{encode_eof, encode_registry};
@@ -16,7 +18,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::signal;
-use tracing::{error, info, instrument, warn};
+use tracing::{Instrument, error, error_span, info, instrument, warn};
 
 #[async_trait]
 pub trait PromScraper {
@@ -131,6 +133,32 @@ impl<T: PromScraper + Send + Sync + 'static> Exporter<T> {
     }
 
     pub async fn run(&self) {
+        let app = self.router();
+        let listener = match TcpListener::bind(&self.socket).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                error!(address = %self.socket, error = %err, "Failed to bind");
+                return;
+            }
+        };
+        match listener.local_addr() {
+            Ok(addr) => info!(address = %addr, "Listening"),
+            Err(err) => warn!(error = %err, "Failed to get local address"),
+        }
+        let server = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal());
+        match server.await {
+            Ok(()) => info!("Exporter is shut down"),
+            Err(err) => error!(error = %err, "Server error"),
+        }
+    }
+
+    /// The exporter's routes. Serving it requires `ConnectInfo<SocketAddr>`,
+    /// which the request log uses for the client address.
+    fn router(&self) -> Router {
         let mut registry = <Registry>::default();
         let success_metric = Family::<SuccessMetricLabels, Counter>::default();
         registry.register(
@@ -147,7 +175,7 @@ impl<T: PromScraper + Send + Sync + 'static> Exporter<T> {
         );
         let registry = Arc::new(registry);
         let home_page = self.home_page.clone();
-        let app = Router::new()
+        Router::new()
             .route("/", get(|| async { home_page }))
             .route(
                 "/status",
@@ -164,23 +192,97 @@ impl<T: PromScraper + Send + Sync + 'static> Exporter<T> {
                     let registry = Arc::clone(&registry);
                     || async move { get_metrics(&*scraper, &success_metric, &registry).await }
                 }),
-            );
-        let listener = match TcpListener::bind(&self.socket).await {
-            Ok(listener) => listener,
-            Err(err) => {
-                error!(address = %self.socket, error = %err, "Failed to bind");
-                return;
-            }
-        };
-        match listener.local_addr() {
-            Ok(addr) => info!(address = %addr, "Listening"),
-            Err(err) => warn!(error = %err, "Failed to get local address"),
-        }
-        let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
-        match server.await {
-            Ok(()) => info!("Exporter is shut down"),
-            Err(err) => error!(error = %err, "Server error"),
-        }
+            )
+            .layer(middleware::from_fn(log_request))
+    }
+}
+
+/// Log every request served, once the response is ready.
+///
+/// Everything logged while handling the request shares a `trace_id`, carried
+/// by a span around the handler. The request details are fields of the final
+/// event only: the scrape logs emitted while serving `/metrics` carry the
+/// upstream Graph call's `http_status`, which must not be mixed with this
+/// request's.
+async fn log_request(
+    ConnectInfo(client): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let trace_id = incoming_trace_id(request.headers()).unwrap_or_else(new_trace_id);
+    // At error level so that it is enabled whenever any event is: the span only
+    // carries context, and a `warn` filter must not strip it from warnings.
+    let span = error_span!("http_request", trace_id);
+    serve_logged(client, request, next).instrument(span).await
+}
+
+async fn serve_logged(client: SocketAddr, request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let http_version = http_version(request.version());
+    let user_agent = request
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
+    let start = Instant::now();
+    let response = next.run(request).await;
+    let duration_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+
+    let status = response.status();
+    let outcome = if status.is_client_error() || status.is_server_error() {
+        "failure"
+    } else {
+        "success"
+    };
+    info!(
+        action = "http-request",
+        outcome,
+        method = %method,
+        path,
+        http_version,
+        http_status = status.as_u16(),
+        client_address = %client,
+        user_agent,
+        duration_ns,
+        "{method} {path} {}",
+        status.as_u16()
+    );
+    response
+}
+
+/// The trace id of a valid W3C `traceparent` header, so that the request's
+/// logs can be matched with those of the caller.
+fn incoming_trace_id(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get("traceparent")?.to_str().ok()?;
+    let mut parts = value.split('-');
+    let version = parts.next()?;
+    let trace_id = parts.next()?;
+    let valid = version.len() == 2
+        && version != "ff"
+        && trace_id.len() == 32
+        && trace_id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && trace_id.bytes().any(|b| b != b'0');
+    valid.then(|| trace_id.to_owned())
+}
+
+/// A random W3C-style trace id: 32 lowercase hex digits, not all zero.
+fn new_trace_id() -> String {
+    format!("{:032x}", rand::random::<u128>().max(1))
+}
+
+/// The HTTP version the way ECS writes it in `http.version`.
+fn http_version(version: Version) -> &'static str {
+    match version {
+        Version::HTTP_09 => "0.9",
+        Version::HTTP_10 => "1.0",
+        Version::HTTP_11 => "1.1",
+        Version::HTTP_2 => "2",
+        Version::HTTP_3 => "3",
+        _ => "unknown",
     }
 }
 
@@ -191,7 +293,13 @@ async fn status<T: PromScraper + Send + Sync + 'static>(scraper: Arc<T>) -> impl
     }
 }
 
-#[instrument(name = "scrape", skip_all, fields(action = "scrape", scraper = scraper.name()))]
+// At error level for the same reason as the `http_request` span.
+#[instrument(
+    name = "scrape",
+    level = "error",
+    skip_all,
+    fields(action = "scrape", scraper = scraper.name())
+)]
 async fn get_metrics<S: PromScraper + Send + Sync + 'static>(
     scraper: &S,
     success_metric: &Family<SuccessMetricLabels, Counter>,
@@ -291,10 +399,42 @@ mod tests {
     use axum::http::HeaderMap;
     use serde_json::json;
 
-    /// Runs a real scrape against a mock Graph that rejects the request, and
-    /// checks that the status and request id reach the log as ECS fields.
-    #[tokio::test]
-    async fn logs_graph_errors_as_http_fields() {
+    struct StubScraper;
+
+    #[async_trait]
+    impl PromScraper for StubScraper {
+        async fn scrape(&self) -> Result<Registry> {
+            Ok(Registry::default())
+        }
+
+        async fn ready(&self) -> std::result::Result<String, String> {
+            Err("Unavailable: stub".to_string())
+        }
+
+        fn name(&self) -> &str {
+            "Stub"
+        }
+    }
+
+    /// Serve an exporter for `scraper` on a free local port, the way `run` does.
+    async fn serve_exporter<T: PromScraper + Send + Sync + 'static>(scraper: T) -> SocketAddr {
+        let app = Exporter::new("127.0.0.1:0".parse().unwrap(), scraper).router();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap()
+        });
+        addr
+    }
+
+    /// A Graph that rejects every request with a 403, and the applications URL
+    /// to reach it.
+    async fn serve_forbidding_graph() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mock_graph = Router::new().route(
@@ -312,17 +452,126 @@ mod tests {
             }),
         );
         tokio::spawn(async move { axum::serve(listener, mock_graph).await.unwrap() });
-        let scraper = graph_client(format!("http://{addr}/applications/")).await;
+        format!("http://{addr}/applications/")
+    }
+
+    fn is_trace_id(value: &serde_json::Value) -> bool {
+        value.as_str().is_some_and(|id| {
+            id.len() == 32
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        })
+    }
+
+    /// Every request served is logged once, including unknown paths, with the
+    /// request details as ECS fields.
+    #[tokio::test]
+    async fn logs_served_requests() {
+        let addr = serve_exporter(StubScraper).await;
 
         let logs = LogCapture::start();
-        let response = get_metrics(&scraper, &Family::default(), &Registry::default()).await;
+        let client = reqwest::Client::new();
+        for path in ["/status", "/nope"] {
+            client
+                .get(format!("http://{addr}{path}"))
+                .header(header::USER_AGENT, "Prometheus/3.0.0")
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let requests: Vec<_> = logs
+            .lines()
+            .into_iter()
+            .filter(|line| line["event"]["action"] == "http-request")
+            .collect();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+
+        let status = &requests[0];
+        assert_eq!(status["message"], "GET /status 503");
+        assert_eq!(status["event"]["outcome"], "failure");
+        assert!(status["event"]["duration"].as_u64().unwrap() > 0);
+        assert_eq!(
+            status["http"],
+            json!({"version": "1.1", "request": {"method": "GET"}, "response": {"status_code": 503}})
+        );
+        assert_eq!(status["url"], json!({"path": "/status"}));
+        assert_eq!(
+            status["user_agent"],
+            json!({"original": "Prometheus/3.0.0"})
+        );
+        assert_eq!(status["client"]["ip"], "127.0.0.1");
+        assert!(status["client"]["port"].as_u64().unwrap() > 0);
+        assert_eq!(status["log"]["level"], "info");
+
+        let unknown = &requests[1];
+        assert_eq!(unknown["message"], "GET /nope 404");
+        assert_eq!(unknown["http"]["response"]["status_code"], 404);
+
+        assert!(is_trace_id(&status["trace"]["id"]), "{status}");
+        assert!(is_trace_id(&unknown["trace"]["id"]), "{unknown}");
+        assert_ne!(status["trace"]["id"], unknown["trace"]["id"]);
+    }
+
+    /// A caller's W3C trace id is reused; an invalid one is replaced.
+    #[tokio::test]
+    async fn reuses_incoming_trace_ids() {
+        let addr = serve_exporter(StubScraper).await;
+
+        let logs = LogCapture::start();
+        let client = reqwest::Client::new();
+        for traceparent in [
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+            "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+            "garbage",
+        ] {
+            client
+                .get(format!("http://{addr}/"))
+                .header("traceparent", traceparent)
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let trace_ids: Vec<_> = logs
+            .lines()
+            .into_iter()
+            .filter(|line| line["event"]["action"] == "http-request")
+            .map(|line| line["trace"]["id"].clone())
+            .collect();
+        assert_eq!(trace_ids.len(), 4, "{trace_ids:?}");
+        assert_eq!(trace_ids[0], "4bf92f3577b34da6a3ce929d0e0e4736");
+        for generated in &trace_ids[1..] {
+            assert!(is_trace_id(generated), "{generated}");
+            assert_ne!(generated, "4bf92f3577b34da6a3ce929d0e0e4736");
+            assert_ne!(generated, "00000000000000000000000000000000");
+        }
+    }
+
+    /// Serves `/metrics` backed by a mock Graph that rejects the request, and
+    /// checks that the Graph status and request id reach the log as ECS fields,
+    /// on a line sharing its trace id with the request log.
+    #[tokio::test]
+    async fn logs_graph_errors_as_http_fields() {
+        let scraper = graph_client(serve_forbidding_graph().await).await;
+        let addr = serve_exporter(scraper).await;
+
+        let logs = LogCapture::start();
+        let response = reqwest::get(format!("http://{addr}/metrics"))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         let lines = logs.lines();
-        let failure = lines
-            .iter()
-            .find(|line| line["message"] == "Scrape failed")
-            .unwrap_or_else(|| panic!("no scrape failure logged: {lines:?}"));
+        let find = |message: &str| {
+            lines
+                .iter()
+                .find(|line| line["message"] == message)
+                .unwrap_or_else(|| panic!("no {message:?} logged: {lines:?}"))
+        };
+        let failure = find("Scrape failed");
         assert_eq!(
             failure["http"],
             json!({"request": {"id": "abc-123"}, "response": {"status_code": 403}})
@@ -336,6 +585,35 @@ mod tests {
         assert_eq!(failure["event"]["outcome"], "failure");
         assert!(failure["event"]["duration"].as_u64().unwrap() > 0);
         assert_eq!(failure["log"]["level"], "warn");
+
+        let request = find("GET /metrics 200");
+        assert!(is_trace_id(&failure["trace"]["id"]), "{failure}");
+        assert_eq!(failure["trace"]["id"], request["trace"]["id"]);
+    }
+
+    /// With `RUST_LOG=warn`, warnings keep the context of the spans they are
+    /// logged in, even though those spans are not warnings themselves.
+    #[tokio::test]
+    async fn warn_filter_keeps_span_context() {
+        let scraper = graph_client(serve_forbidding_graph().await).await;
+        let addr = serve_exporter(scraper).await;
+
+        let logs = LogCapture::with_filter("warn");
+        reqwest::get(format!("http://{addr}/metrics"))
+            .await
+            .unwrap();
+
+        let lines = logs.lines();
+        assert_eq!(
+            lines.len(),
+            1,
+            "only the scrape failure is a warning: {lines:?}"
+        );
+        let failure = &lines[0];
+        assert_eq!(failure["message"], "Scrape failed");
+        assert!(is_trace_id(&failure["trace"]["id"]), "{failure}");
+        assert_eq!(failure["event"]["action"], "scrape");
+        assert_eq!(failure["aasm"]["scraper"], "Azure App Secrets");
     }
 
     /// Label values must be escaped per the OpenMetrics text format, otherwise an

@@ -130,6 +130,7 @@ dependencies = [
  "config",
  "oauth2",
  "prometheus-client",
+ "rand 0.8.8",
  "reqwest",
  "serde",
  "serde_json",
