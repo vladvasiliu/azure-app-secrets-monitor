@@ -28,6 +28,7 @@ static AZURE_SCOPE: &str = "https://graph.microsoft.com/.default";
 static AZURE_APPLICATIONS_ENDPOINT: &str = "https://graph.microsoft.com/v1.0/applications/";
 static AZURE_TOKEN_MIN_LIFETIME: u64 = 60;
 static AZURE_TOKEN_FETCH_RETRY: u64 = 10;
+static AZURE_TIMEOUT: u64 = 10;
 /// Unparseable error bodies are logged verbatim, up to this many characters.
 static GRAPH_ERROR_BODY_MAX_CHARS: usize = 1024;
 
@@ -277,7 +278,7 @@ impl AzureGraphClient {
         let http_client = HttpClient::builder()
             .user_agent(APP_USER_AGENT)
             .gzip(true)
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(AZURE_TIMEOUT))
             .https_only(https_only)
             .build()?;
 
