@@ -1,6 +1,6 @@
 [package]
 name = "azure-app-secrets-monitor"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 authors = ["Vlad Vasiliu"]
 
@@ -18,7 +18,7 @@ rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["gzip", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "net", "parking_lot", "rt", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "net", "parking_lot", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "smallvec"] }
 #graph-rs-sdk = "0.2"

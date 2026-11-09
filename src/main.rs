@@ -11,7 +11,7 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tracing::error;
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() {
     logging::init();
 
